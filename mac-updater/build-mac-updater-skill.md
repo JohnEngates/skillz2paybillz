@@ -81,10 +81,29 @@ Parse the argument after /mac-updater:
 | (none) or `full` | All phases: updates + security + health |
 | `update` | Package manager updates only (Phase 1) |
 | `security` | Security audit only (Phase 2) |
-| `quick` | Fast summary: outdated counts, security posture, disk space |
+| `quick` | Fast summary: security posture, disk space, cheap outdated counts |
 
 For `quick` mode: limit output to one summary table and the top 3 issues only.
-Skip detailed command output. Aim for under 15 seconds.
+Skip detailed command output. Aim for under 30 seconds in the common case.
+
+**Quick mode command budget.** Some commands are too slow or too flaky to
+run in quick mode. Observe these rules:
+
+- `brew outdated`: prefix with `HOMEBREW_NO_AUTO_UPDATE=1` to skip the
+  metadata refresh. Expect 5-30s depending on installed package count.
+  If even that is too slow, report "run `/mac-updater update` for counts"
+  and skip.
+- `brew outdated --cask --greedy`: skip in quick mode (network-heavy).
+- `npm outdated -g`: cap at 10s via `perl -e 'alarm(10); exec(@ARGV)'`.
+- `pip3 list --outdated`: SKIP in quick mode. Queries PyPI for every
+  installed package; in a conda env this can exceed 2 minutes. Note it
+  as "skipped (slow in conda envs)" in the summary.
+- `softwareupdate -l`: skip in quick mode (slow, network-bound).
+
+Every slow-capable command in any mode must have an upper-bound timeout.
+Use `perl -e 'alarm(N); exec(@ARGV)' <cmd> <args>` as a portable timeout
+(macOS lacks GNU `timeout` by default). Do NOT install `coreutils` just to
+get `gtimeout`.
 
 ### Progress Tracking
 
@@ -133,6 +152,44 @@ full audit. Do NOT create tasks for `quick` mode -- it should finish in under
 
 ---
 
+### Debug Logging
+
+At the start of every run (including `quick` mode), create a debug log:
+
+```bash
+mkdir -p ~/.mac-updater-debug
+LOG=~/.mac-updater-debug/run-$(date +%Y%m%d-%H%M%S).log
+{
+  echo "# mac-updater run"
+  echo "# date: $(date)"
+  echo "# mode: <mode>"
+  echo "# macOS: $(sw_vers -productVersion) ($(sw_vers -buildVersion))"
+  echo "# arch: $(uname -m)"
+} > "$LOG"
+```
+
+For each command you run during the audit, append command + output + exit
+code + timing to the log. Pattern:
+
+```bash
+{
+  echo ""
+  echo "## <section-id>: <description>"
+  echo "\$ <command>"
+  start=$(date +%s)
+  <command> 2>&1
+  echo "exit=$?"
+  echo "elapsed=$(( $(date +%s) - start ))s"
+} >> "$LOG" 2>&1
+```
+
+The log is the raw input for iterating on this skill -- it captures real
+failure modes, timing, and command output that would otherwise scroll away.
+Do NOT print the log contents to the user; just tell them the path at the
+end. Never log sudo passwords or secret material.
+
+---
+
 ### Pre-Flight: System Identification
 
 Before any checks, capture and display the macOS version:
@@ -154,11 +211,19 @@ that some checks may behave differently.
 
 #### Section 1: Runtime Discovery
 
-Detect which package managers are installed:
+Detect which package managers are installed. Loop through each tool
+individually so the probe always exits 0 even when some tools are missing:
 
 ```bash
-command -v brew npm pip3 pip-audit conda mas cargo gem go rustup composer 2>/dev/null
+for t in brew npm pip3 pip-audit conda mas cargo gem go rustup composer; do
+  p=$(command -v "$t" 2>/dev/null) && echo "$t: $p" || echo "$t: not installed"
+done
 ```
+
+Do NOT use `command -v brew npm pip3 ...` with multiple args on one line:
+`command -v` returns exit 1 if *any* of the listed tools is missing, which
+causes the harness to cancel sibling parallel tool calls even though the
+output was correct. The loop form always exits 0.
 
 Note: use `command -v` instead of `which` -- it is POSIX-compliant and behaves
 consistently across bash and zsh. `which` can produce inconsistent results
@@ -181,18 +246,20 @@ of old Xcode on external drives), STOP and warn. Suggest:
 sudo xcode-select -s /Library/Developer/CommandLineTools
 ```
 
-2. Check if Xcode license needs acceptance:
+2. Check if Xcode license needs acceptance. Run in its *own* tool call and
+   capture the exit code -- non-zero is the signal we're looking for and
+   would otherwise cancel sibling parallel calls:
 ```bash
-xcodebuild -license check 2>&1
+xcodebuild -license check 2>&1; echo "exit=$?"
 ```
-If not accepted, warn that brew operations will fail until the user runs:
+If exit is non-zero, warn that brew operations will fail until the user runs:
 ```bash
 sudo xcodebuild -license accept
 ```
 
 Do NOT proceed with brew operations until both checks pass.
 
-Then:
+Then (for `full` and `update` modes):
 ```bash
 brew update 2>&1
 brew outdated 2>&1
@@ -201,6 +268,14 @@ brew outdated --cask --greedy 2>&1
 brew list --pinned 2>&1
 brew cleanup --dry-run 2>&1 | tail -1
 ```
+
+For `quick` mode, skip `brew update` and the cask/greedy/cleanup calls;
+use cached metadata only:
+```bash
+HOMEBREW_NO_AUTO_UPDATE=1 brew outdated 2>&1 | wc -l
+```
+Report just the formula count. If even this is too slow (>15s on a low-end
+machine), report "N/A in quick mode -- run `/mac-updater update`."
 
 Present as a table: Package | Current | Latest | Type.
 Show greedy casks separately from regular casks (these auto-update themselves,
@@ -223,24 +298,41 @@ Then: `npm outdated -g --depth=0 2>&1`
 
 #### Section 4: Python (pip)
 
-Detect environment first:
+Detect environment. **Do not rely on `$CONDA_DEFAULT_ENV`** -- the Claude
+Code Bash tool runs non-interactive shells, and conda activation (which is
+what sets `$CONDA_DEFAULT_ENV`) only runs in interactive login shells. Use
+path-based detection instead:
 ```bash
+PIP3=$(command -v pip3 2>/dev/null)
 echo "Python: $(command -v python3)"
-echo "Conda env: ${CONDA_DEFAULT_ENV:-none}"
+echo "pip3 path: $PIP3"
+case "$PIP3" in
+  */anaconda3/*|*/miniconda3/*|*/miniforge3/*|*/mambaforge/*) CONDA_ACTIVE=1 ;;
+  *) CONDA_ACTIVE=0 ;;
+esac
+echo "conda-managed: $CONDA_ACTIVE"
 pip3 --version 2>&1
 ```
 
-If conda env is active, display prominent warning:
-> WARNING: Active conda environment detected. pip upgrades can break
-> conda-managed dependencies. Use `conda update` for conda-managed packages.
+If `CONDA_ACTIVE=1`, display prominent warning:
+> WARNING: pip3 is managed by a conda/mamba distribution. pip upgrades can
+> break conda-managed dependencies. Use `conda update` for conda-managed
+> packages.
 
 Security scan (if pip-audit installed): `pip-audit 2>&1`
 Present CVEs as: Package | Version | CVE | Fix Version | Severity
 
-If in a conda env, cross-reference CVE findings with `conda list` before
+If conda-managed, cross-reference CVE findings with `conda list` before
 recommending pip-based fixes.
 
-Outdated: `pip3 list --outdated 2>&1`
+**Outdated (SKIP in quick mode).** In conda envs, `pip3 list --outdated`
+queries PyPI for every installed package and can hang for minutes. Always
+wrap with a hard timeout:
+```bash
+perl -e 'alarm(30); exec(@ARGV)' pip3 list --outdated 2>&1
+```
+If the wrapper kills it, report "pip3 outdated check timed out -- run
+manually with a longer timeout if needed."
 
 When upgrading: classify packages as conda-managed vs pip-managed first
 (check `conda list --json` and compare channels). Use `conda update` for
@@ -291,12 +383,14 @@ Report only. Do not auto-update.
 
 #### Section 8: Core Protections
 
-Run in parallel:
+Run in parallel. Each command is wrapped with `|| true` so a single failure
+(e.g. firewall helper returning non-zero on a locked-down system) doesn't
+cancel the sibling parallel tool calls:
 ```bash
-csrutil status 2>&1                                                    # SIP
-fdesetup status 2>&1                                                   # FileVault
-/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>&1  # Firewall
-spctl --status 2>&1                                                    # Gatekeeper
+csrutil status 2>&1 || true                                                    # SIP
+fdesetup status 2>&1 || true                                                   # FileVault
+/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>&1 || true  # Firewall
+spctl --status 2>&1 || true                                                    # Gatekeeper
 ```
 
 **Firewall depth check** (if firewall is enabled):
@@ -320,12 +414,16 @@ permanent data loss." Only run if user approves. If they decline, note it as
 unchecked rather than failing.
 
 **Passwordless sudo check:**
+
+Run this in its *own* tool call, never batched with other checks -- the exit
+code is the signal, and a non-zero exit (the expected safe state) would
+cancel sibling parallel calls. Capture the exit code explicitly:
 ```bash
-sudo -n true 2>&1
+sudo -n true 2>&1; echo "exit=$?"
 ```
-If this succeeds (exit code 0), flag as **Critical**: the user has NOPASSWD
-sudo configured, meaning any process running as their user is effectively root.
-This is a major privilege escalation risk.
+If exit is 0, flag as **Critical**: the user has NOPASSWD sudo configured,
+meaning any process running as their user is effectively root. This is a
+major privilege escalation risk. Exit 1 is the expected safe state.
 
 **XProtect version and freshness:**
 ```bash
@@ -359,14 +457,23 @@ Note: DNS may also be configured per-network in advanced settings or overridden
 by DNS-over-HTTPS at the browser level, which bypasses system DNS entirely.
 
 **Remote access services:**
+
+`systemsetup -getremotelogin` now requires admin on modern macOS and will
+print "You need administrator access to run this tool" without sudo. Use
+`launchctl` for a non-admin probe of the SSH daemon state instead:
 ```bash
-systemsetup -getremotelogin 2>&1
-defaults read /Library/Preferences/com.apple.RemoteManagement.plist 2>/dev/null
+# SSH / Remote Login -- non-admin probe
+launchctl print-disabled system 2>/dev/null | grep -E "com\.openssh\.sshd|ssh\.plist" || true
+launchctl list 2>/dev/null | grep -E "com\.openssh\.sshd" || true
+# If neither returns a match, SSH is not loaded. If print-disabled says
+# "com.openssh.sshd" => false, SSH is enabled.
+
+# Apple Remote Desktop
+defaults read /Library/Preferences/com.apple.RemoteManagement 2>/dev/null || echo "ARD: not configured"
+# Screen Sharing
+defaults read /Library/Preferences/com.apple.screensharing 2>/dev/null || echo "Screen Sharing: not configured"
 ```
-Also check Screen Sharing:
-```bash
-defaults read /Library/Preferences/com.apple.screensharing 2>/dev/null
-```
+
 Flag any enabled remote access service as **Important**. These are legitimate
 features but should be intentionally enabled, not left on by accident. Remote
 Login means SSH is open. Remote Management is Apple Remote Desktop (ARD).
@@ -375,8 +482,17 @@ Login means SSH is open. Remote Management is Apple Remote Desktop (ARD).
 
 ```bash
 ls -la ~/.ssh/ 2>&1
-for f in ~/.ssh/id_*; do [ -f "$f" ] && ssh-keygen -l -f "$f" 2>&1; done
-ssh-add -l 2>&1
+# Fingerprint every private-key-shaped file, not just id_*.
+# The `id_*` pattern misses common alternate names (vendor keys like
+# Lambdalabs, runpod_key, work_laptop, etc.). Heuristic: 0600 regular file
+# in ~/.ssh that is NOT .pub, NOT known_hosts, NOT config, NOT authorized_keys.
+find ~/.ssh -maxdepth 1 -type f -perm 600 \
+  ! -name '*.pub' ! -name 'known_hosts*' ! -name 'config' \
+  ! -name 'authorized_keys*' ! -name 'environment' 2>/dev/null | \
+while IFS= read -r f; do
+  ssh-keygen -l -f "$f" 2>&1 || true
+done
+ssh-add -l 2>&1 || true
 ```
 
 **Directory permissions:** The `~/.ssh/` directory itself must be 700. If it's
@@ -414,12 +530,28 @@ List all non-Apple entries. Flag unknown publishers or suspicious names.
 Cross-reference with references/known-gotchas.md.
 
 **Login Items & Background Items** (modern macOS persistence):
+
+On macOS 26+, `sfltool dumpbtm` triggers a **GUI authorization dialog** in a
+non-interactive shell rather than returning a plain non-zero exit. The dialog
+blocks the audit until the user clicks. This is worse than failing fast.
+
+Policy: only run `sfltool dumpbtm` when the user has explicitly asked for the
+full deep scan AND has been warned about the dialog, OR skip it entirely in
+non-interactive / default runs. Prefer a short timeout wrapper so we don't
+hang forever if the user ignores the dialog:
+
 ```bash
-sfltool dumpbtm 2>&1
+# Quick/default: skip with an explanatory note
+echo "sfltool dumpbtm: skipped (requires admin + GUI auth on macOS 26+)"
+echo "Review background items in System Settings > General > Login Items."
+
+# Deep mode only, with user-approved warning:
+# perl -e 'alarm(15); exec(@ARGV)' sfltool dumpbtm 2>&1 | head -200 || true
 ```
+
 This shows background items registered via the SMAppService API -- these don't
-appear in LaunchAgents directories. May require admin privileges; fail
-gracefully if unavailable or on older macOS (pre-Ventura).
+appear in LaunchAgents directories. On older macOS (pre-Ventura), `sfltool`
+doesn't exist; skip silently.
 
 **Crontab & at jobs** (legacy persistence):
 ```bash
@@ -431,15 +563,28 @@ uses them because administrators overlook them. Flag any entries for review.
 
 #### Section 12: TCC / Privacy Permissions
 
+Attempt to read the user-level TCC database. On some configurations it works
+without Full Disk Access (observed empirically on macOS 26.4.1); on others it
+fails. Don't assume either outcome -- branch on it:
+
 ```bash
-sqlite3 "$HOME/Library/Application Support/com.apple.TCC/TCC.db" \
-  "SELECT client, service, auth_value FROM access WHERE auth_value = 2;" 2>&1
+TCCDB="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
+TCC_OUT=$(perl -e 'alarm(5); exec(@ARGV)' sqlite3 "$TCCDB" \
+  "SELECT client, service FROM access WHERE auth_value = 2 AND client NOT LIKE 'com.apple.%';" 2>&1)
+TCC_EXIT=$?
 ```
 
-If this fails (common -- requires Full Disk Access for the terminal), note:
+If `TCC_EXIT` is 0 and `TCC_OUT` is non-empty: parse and present the list.
+Group by client (app bundle id) and show which services each app has been
+granted. Flag clients the user may not recognize or whose permissions look
+out of proportion to the app's purpose (e.g. a wallpaper app with
+`kTCCServiceMicrophone`).
+
+If `TCC_EXIT` is non-zero (permission denied, db locked, or newer macOS
+restrictions), fall back to:
 > TCC database is not readable from this terminal. To review privacy
-> permissions, check System Settings > Privacy & Security. Grant your terminal
-> Full Disk Access if you want programmatic TCC auditing.
+> permissions, check System Settings > Privacy & Security. Grant your
+> terminal Full Disk Access if you want programmatic TCC auditing.
 
 On newer macOS versions, even Full Disk Access may not be sufficient for
 some TCC queries. Fail gracefully and move on.
@@ -450,24 +595,74 @@ Browser extensions are the #1 actual attack vector on consumer Macs. A
 malicious or overly-permissive extension can read every page, exfiltrate
 cookies, inject scripts, and access passwords.
 
-**Chrome extensions:**
+**Discovery across all Chromium-family browsers.** Walk every profile, not
+just `Default/`. Multi-profile setups store extensions under `Profile 1/`,
+`Profile 2/`, etc.
+
 ```bash
-ls ~/Library/Application\ Support/Google/Chrome/Default/Extensions/ 2>&1
+for base in \
+  "$HOME/Library/Application Support/Google/Chrome" \
+  "$HOME/Library/Application Support/BraveSoftware/Brave-Browser" \
+  "$HOME/Library/Application Support/Microsoft Edge" \
+  "$HOME/Library/Application Support/Arc" \
+  "$HOME/Library/Application Support/Vivaldi"; do
+  [ -d "$base" ] || continue
+  for profile in "$base"/Default "$base"/Profile\ *; do
+    [ -d "$profile/Extensions" ] || continue
+    echo "== $profile =="
+    ls -1 "$profile/Extensions" 2>/dev/null
+  done
+done
 ```
-For each extension directory, read its `manifest.json` and flag:
-- Extensions with `<all_urls>` or `*://*/*` in permissions (can read every page)
-- Extensions with `cookies`, `webRequest`, or `tabs` permissions
-- Extensions not from the Chrome Web Store (sideloaded)
 
-**Other browsers** (best-effort, check if paths exist):
-- Brave: `~/Library/Application Support/BraveSoftware/Brave-Browser/Default/Extensions/`
-- Edge: `~/Library/Application Support/Microsoft Edge/Default/Extensions/`
-- Firefox: `~/Library/Application Support/Firefox/Profiles/*/extensions.json`
+**Name resolution.** Many extensions set their manifest `name` to a
+placeholder like `__MSG_extName__` and store the real display name in
+`_locales/<lang>/messages.json`. Naive parsers show `(localized)` and
+leave the user to map IDs to names manually. Resolve the real name:
 
-Present as: Extension Name | Permissions | Assessment.
-This is a best-effort audit -- extension paths vary by browser version and
-profile. Note any extensions that couldn't be identified by name (the
-extension directory name is a Chrome Web Store ID).
+```python
+# for each extension's latest version dir:
+import json, os
+manifest = json.load(open(f"{ext_dir}/manifest.json"))
+name = manifest.get("name", "")
+if name.startswith("__MSG_") and name.endswith("__"):
+    key = name[6:-2]
+    default_locale = manifest.get("default_locale", "en")
+    for lang in (default_locale, "en", "en_US"):
+        msg_path = f"{ext_dir}/_locales/{lang}/messages.json"
+        if os.path.exists(msg_path):
+            msgs = json.load(open(msg_path))
+            entry = msgs.get(key) or msgs.get(key.lower())
+            if entry and "message" in entry:
+                name = entry["message"]
+                break
+# name is now the human-readable display name
+```
+
+Extensions with no resolvable name (sideloaded, or locale file missing) must
+be reported with their ID + a note so the user can look them up at
+chrome://extensions.
+
+**Risk tiering.** Flat lists of permissions are hard to triage. Tier each
+extension by its most dangerous capability combination:
+
+| Tier | Permission pattern | Example implication |
+|---|---|---|
+| Critical | `debugger` + host access (`<all_urls>`, `http://*/*`, etc.) | Can intercept and modify any traffic on any site |
+| Critical | `nativeMessaging` + host access + `cookies` | Can exfiltrate cookies to a native helper |
+| Important | `<all_urls>` + (`webRequest` or `cookies` or `scripting`) | Can read every page, intercept requests, or read cookies across sites |
+| Important | `management` + `<all_urls>` | Can enumerate/disable other extensions and snoop everywhere |
+| Routine | Host access limited to specific domains | Scope-limited |
+| Routine | Narrow permissions (e.g. `storage`, `activeTab`) | Minimal risk |
+
+Sideloaded extensions (not installed from the Chrome Web Store) are always
+at least **Important** regardless of permissions.
+
+**Firefox** (best-effort): `~/Library/Application Support/Firefox/Profiles/*/extensions.json`
+
+Present as: Tier | Name | Browser/Profile | Key Permissions | Extension ID.
+Sort by tier. This is a best-effort audit -- extension paths vary by browser
+version and profile.
 
 ---
 
@@ -554,6 +749,39 @@ End with: "Which of these would you like me to handle?"
 **Export option:** After presenting recommendations, also offer:
 "Would you like me to save this report to ~/mac-audit-YYYY-MM-DD.md?"
 
+---
+
+### Post-Run Self-Review
+
+Before closing out, append a self-review block to the debug log. This is
+structured feedback that feeds back into improving this skill:
+
+```bash
+cat >> "$LOG" <<'SELFREVIEW'
+
+## Self-Review
+SELFREVIEW
+```
+
+Then answer each of the following honestly in the log (not to the user),
+one short line each:
+
+1. **Unexpected output** -- any command whose output format differed from
+   what the spec expects (different columns, extra warnings, empty when
+   non-empty expected, etc.)?
+2. **Skipped sections** -- anything skipped, and why (tool not installed,
+   permission denied, command not found, timed out)?
+3. **Spec ambiguity** -- any place the spec was unclear and you had to make
+   a judgment call? Note the call you made.
+4. **Slow commands** -- any single command that took >5 seconds?
+5. **Scope creep or gaps** -- anything the user seemed to want that the
+   spec didn't cover, or anything the spec asked for that felt like noise?
+6. **Exit-code surprises** -- any command that exited non-zero where the
+   spec didn't warn it would?
+
+End the run by telling the user one line:
+"Debug log + self-review saved to $LOG"
+
 Note: Do NOT default to ~/Desktop or ~/Documents -- if iCloud Drive sync is
 enabled, those directories are synced to Apple's servers, and this report
 contains security-sensitive information (open ports, SSH key fingerprints,
@@ -568,10 +796,26 @@ ask the user where they'd like it saved.
 2. **Detect before using.** Always check if a tool exists before calling it.
 3. **Fail gracefully.** One failure must not block the rest of the audit.
 4. **Explain sudo.** Say why elevated privileges are needed before asking.
-5. **Batch for speed.** Run independent checks in parallel.
+5. **Batch for speed, safely.** Run independent checks in parallel -- but
+   every command in a parallel batch must be exit-code-safe. The Claude Code
+   harness cancels sibling parallel tool calls when one exits non-zero. Many
+   perfectly normal read-only probes return non-zero (e.g. `command -v` with
+   a missing tool, `grep` with no matches, `defaults read` on a missing key,
+   `brew outdated` in some versions). Wrap such commands with `|| true`, or
+   run them in a loop / `{ ...; true; }` group so the whole tool call exits 0.
+   Commands whose exit code *is* the signal (see principle 9) must never be
+   batched with unrelated checks -- run them in their own tool call.
 6. **Show your work.** Include command output so the user can verify.
 7. **Check known gotchas.** Reference the gotchas file before risky operations.
 8. **Confirm before destructive actions.** Cleanup, removal, and dependency-conflicting upgrades need approval.
+9. **Isolate signal-via-exit-code commands.** These commands report their
+   result through the exit code and must be run in their own tool call,
+   never parallelized with other checks:
+   - `sudo -n true` -- exit 0 means passwordless sudo is configured (Critical)
+   - `xcodebuild -license check` -- non-zero means license not accepted
+   - `xcode-select -p` followed by `[ -d "$path" ]` -- detecting stale paths
+   Capture the exit code explicitly (`cmd; echo "exit=$?"`) and interpret it
+   rather than letting it bubble up and cancel other work.
 
 ---
 
