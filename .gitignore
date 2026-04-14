@@ -1,0 +1,16 @@
+# macOS
+.DS_Store
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude Code local state
+.claude/
+CLAUDE.local.md
+
+# Rendered skill outputs (these are generated from the build prompts)
+*/SKILL.md
+*/references/
