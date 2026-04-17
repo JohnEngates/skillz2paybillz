@@ -108,47 +108,40 @@ get `gtimeout`.
 ### Progress Tracking
 
 At the start of every run (except `quick` mode), create a task checklist using
-TaskCreate so the user can see real-time progress. The checklist should reflect
-the mode being run:
+TaskCreate so the user can see real-time progress. Keep the checklist at a
+**phase-level granularity** -- don't create one task per section. 19 ticking
+items is noise; 6 meaningful milestones feels like progress.
 
 **For `full` mode, create these tasks:**
 
-1. System identification
-2. Package manager discovery
-3. Homebrew
-4. npm global
-5. Python / pip
-6. Mac App Store
-7. macOS system updates
-8. Other package managers
-9. Core protections
-10. Network security
-11. SSH keys & config
-12. Launch agents & persistence
-13. Browser extensions
-14. TCC permissions
-15. Disk & storage
-16. Time Machine
-17. Memory & swap
-18. Kernel extensions
-19. Summary & recommendations
+1. System identification & package manager discovery
+2. Package updates (Homebrew, npm, pip, mas, OS, others)
+3. Core protections & security posture
+4. Network, SSH, persistence & extensions
+5. System health (disk, TM, memory, kexts)
+6. Summary & recommendations
 
-**For `update` mode:** tasks 1-8 + summary.
-**For `security` mode:** tasks 1, 2, 9-14 + summary.
+**For `update` mode:** tasks 1, 2, 6.
+**For `security` mode:** tasks 1, 3, 4, 6.
 
-As each section starts, mark its task as `in_progress` (this shows a spinner
-with the activeForm text). When it completes, mark it `completed`. If a section
-is skipped (tool not installed, not applicable), mark it `completed` and note
-"skipped" in the output.
+As each phase starts, mark its task as `in_progress` (shows a spinner with
+the activeForm text). When all sections inside that phase are done, mark it
+`completed`. If entire subsections inside a phase are skipped (tool not
+installed, not applicable), note that inline in your output for that phase,
+not as a separate task.
 
-Use short `activeForm` labels for the spinner, e.g.:
-- "Checking Homebrew packages"
-- "Auditing SSH keys"
-- "Scanning browser extensions"
+Use short `activeForm` labels, e.g.:
+- "Checking package managers"
+- "Running security audit"
+- "Checking system health"
 
-This gives the user a clear sense of progress during what can be a 2-3 minute
-full audit. Do NOT create tasks for `quick` mode -- it should finish in under
-15 seconds and the overhead isn't worth it.
+Within each phase, you still run all the individual sections specified below --
+the checklist just tracks the phase, not each micro-check. The user sees
+"Running security audit" once and a block of output covering SIP, FileVault,
+firewall, SSH, etc.
+
+Do NOT create tasks for `quick` mode -- it should finish fast and the
+overhead isn't worth it.
 
 ---
 
@@ -215,10 +208,14 @@ Detect which package managers are installed. Loop through each tool
 individually so the probe always exits 0 even when some tools are missing:
 
 ```bash
-for t in brew npm pip3 pip-audit conda mas cargo gem go rustup composer; do
+for t in brew npm pip3 pip-audit conda mas cargo gem go rustup composer uv pipx; do
   p=$(command -v "$t" 2>/dev/null) && echo "$t: $p" || echo "$t: not installed"
 done
 ```
+
+`uv` (by Astral) is the modern Rust-based Python installer/env manager. If
+present, it's often managing separate tool environments from conda/pip and
+deserves its own check in Section 7.
 
 Do NOT use `command -v brew npm pip3 ...` with multiple args on one line:
 `command -v` returns exit 1 if *any* of the listed tools is missing, which
@@ -246,13 +243,27 @@ of old Xcode on external drives), STOP and warn. Suggest:
 sudo xcode-select -s /Library/Developer/CommandLineTools
 ```
 
-2. Check if Xcode license needs acceptance. Run in its *own* tool call and
-   capture the exit code -- non-zero is the signal we're looking for and
-   would otherwise cancel sibling parallel calls:
+2. Check if Xcode license needs acceptance -- **but only if full Xcode is
+   installed**. The Command Line Tools alone don't have a license to accept,
+   and `xcodebuild -license check` will always fail on CLT-only systems with
+   "tool 'xcodebuild' requires Xcode, but active developer directory is a
+   command line tools instance." That's not a real problem for brew, so
+   don't report it as one.
+
+   Detect CLT-only first, then branch:
 ```bash
-xcodebuild -license check 2>&1; echo "exit=$?"
+DEV_DIR=$(xcode-select -p 2>/dev/null)
+case "$DEV_DIR" in
+  */CommandLineTools*)
+    echo "Xcode: Command Line Tools only (no license check needed)"
+    ;;
+  *)
+    xcodebuild -license check 2>&1; echo "exit=$?"
+    ;;
+esac
 ```
-If exit is non-zero, warn that brew operations will fail until the user runs:
+Run this in its *own* tool call. If the `xcodebuild` branch runs and returns
+non-zero, warn that brew operations will fail until the user runs:
 ```bash
 sudo xcodebuild -license accept
 ```
@@ -319,6 +330,24 @@ If `CONDA_ACTIVE=1`, display prominent warning:
 > break conda-managed dependencies. Use `conda update` for conda-managed
 > packages.
 
+**Channel priority health check** (only when conda is active):
+```bash
+conda config --show channels 2>&1 | head -20
+conda config --show channel_priority 2>&1
+```
+If `defaults` or `pkgs/main` is listed **above** `conda-forge`, AND the env
+contains packages from `conda-forge` (check via `conda list | grep conda-forge`),
+flag as **Important** with explanation:
+> Your channel priority lists defaults above conda-forge, but packages in this
+> env came from conda-forge. `conda update --all` on this env will likely
+> propose surprising downgrades as it tries to normalize packages back to
+> defaults. Consider switching to strict conda-forge priority for ML/scientific
+> envs. See references/known-gotchas.md for the full explanation.
+
+If `channel_priority` is not `strict`, recommend `conda config --set
+channel_priority strict` regardless of channel order -- it prevents the
+solver from mixing channels mid-solve.
+
 Security scan (if pip-audit installed): `pip-audit 2>&1`
 Present CVEs as: Package | Version | CVE | Fix Version | Severity
 
@@ -374,6 +403,12 @@ For each detected: run a lightweight read-only status check.
 - go: `go version 2>&1`
 - rustup: `rustup check 2>&1`
 - composer: `composer global outdated 2>&1`
+- uv: `uv tool list 2>&1 | head -20; uv --version 2>&1`
+  If `uv` is installed, list its globally-installed tools (these are
+  Python CLIs like `yt-dlp`, `llm`, `pip-audit` installed via `uv tool
+  install`). To check if uv itself is outdated, look at the brew formula
+  (if installed via brew) or compare to https://github.com/astral-sh/uv/releases.
+- pipx: `pipx list --short 2>&1 | head -20` (legacy equivalent of uv tool)
 
 Report only. Do not auto-update.
 
@@ -444,17 +479,31 @@ Present as: Process | PID | Port | Binding. Flag non-standard listeners
 (anything not mDNSResponder, rapportd, ControlCenter, or other known macOS
 system services).
 
-**DNS** -- check all active network interfaces, not just Wi-Fi:
+**DNS** -- check all active network interfaces, not just Wi-Fi. Use a single
+loop so the skill doesn't have to manually pick services; it handles disabled
+services (prefixed with `*`) and skips the header line:
 ```bash
-networksetup -listallnetworkservices 2>&1
+networksetup -listallnetworkservices 2>&1 | tail -n +2 | while IFS= read -r svc; do
+  case "$svc" in
+    \**) continue ;;  # disabled (asterisk-prefixed)
+    "") continue ;;
+  esac
+  dns=$(networksetup -getdnsservers "$svc" 2>&1)
+  printf "%-40s %s\n" "$svc" "$(echo "$dns" | tr '\n' ' ')"
+done
 ```
-For each active service (skip lines starting with "An asterisk"):
-```bash
-networksetup -getdnsservers "<service name>" 2>&1
-```
-Note non-standard DNS. Well-known resolvers (1.1.1.1, 8.8.8.8, 9.9.9.9) are fine.
-Note: DNS may also be configured per-network in advanced settings or overridden
-by DNS-over-HTTPS at the browser level, which bypasses system DNS entirely.
+Note non-standard DNS. Well-known resolvers (1.1.1.1, 8.8.8.8, 9.9.9.9,
+1.1.1.2, 1.0.0.2, 9.9.9.11) are fine.
+
+Caveats to call out to the user:
+- DNS may be configured **per-network** in System Settings > Network >
+  Advanced > DNS, which `networksetup -getdnsservers` does NOT show. If the
+  output says "There aren't any DNS Servers set on X" but the network works,
+  the user likely has per-network DNS configured.
+- **DNS-over-HTTPS (DoH)** at the browser level (Chrome, Firefox) bypasses
+  system DNS entirely. The audit cannot see it.
+- **Tailscale / WireGuard** interfaces often show no DNS at the service level
+  even when the VPN pushes its own resolver.
 
 **Remote access services:**
 
@@ -695,8 +744,31 @@ Flag if free space < 10% of container total. SMART should be "Verified".
 ```bash
 tmutil status 2>&1
 tmutil latestbackup 2>&1
+tmutil destinationinfo 2>&1
 ```
 Flag if last backup > 24 hours. Note if not configured.
+
+**Remediation hints** when `tmutil latestbackup` fails:
+
+- **"Failed to mount destination"** -- the target drive or network share is
+  not reachable. Check the output of `tmutil destinationinfo` for the
+  destination kind:
+  - *Local disk (HFS+/APFS):* plug the external drive in. If it's connected
+    but the system can't see it, `diskutil list` will show whether the volume
+    is actually mounted.
+  - *Network (SMB/AFP):* the backup server may be offline, credentials may
+    have rotated, or the network is unreachable. Test with
+    `smbutil view //server` or by browsing to the share in Finder.
+  - *Time Capsule / AirPort:* these are EOL. If this is a Time Capsule,
+    suggest migrating to a modern destination (external SSD or Synology).
+- **"No machine directory found"** -- the destination was erased or is from
+  a different Mac. The user may need to re-pair or start a fresh backup.
+- **"No backups found"** -- configured but never ran. Kick off the first
+  backup manually from System Settings > General > Time Machine.
+
+If Time Machine is not configured at all, flag as **Important** and
+recommend setting up a backup destination. Do not recommend any specific
+product.
 
 #### Section 16: Memory & Swap
 
@@ -975,6 +1047,46 @@ and whether the browser uses a custom profile directory. Multi-profile setups
 have extensions in `Profile 1/`, `Profile 2/`, etc. instead of `Default/`.
 **Fix:** Glob for `*/Extensions/` under the browser's Application Support directory.
 **Check:** Use `ls` to discover available profile directories before scanning.
+
+## Conda Channel Priority Causes Surprise Downgrades
+
+**Symptom:** `conda update --all` dry-run proposes DOWNGRADING core packages
+(pytorch, numpy, libblas/OpenBLAS→netlib, pybind11, torchvision, etc.) instead
+of upgrading them. Also proposes flipping many packages from `conda-forge` to
+`pkgs/main`.
+**Cause:** The env was built primarily from `conda-forge` (which is faster-
+moving and often has newer versions than `pkgs/main`), but the user's channel
+priority lists `defaults` (a.k.a. `pkgs/main`) first. Without strict priority,
+the solver treats `defaults` as authoritative and tries to "normalize" every
+package back to it -- even when that means downgrading.
+**Fix:** Switch to strict conda-forge priority for ML/scientific envs:
+```bash
+conda config --remove channels defaults       # or leave it, but see priority below
+conda config --add channels conda-forge        # top priority
+conda config --set channel_priority strict     # forbids channel-hopping mid-solve
+```
+Then re-run the dry-run: `conda update -n <env> --all --dry-run`.
+**Check:** BEFORE suggesting `conda update --all`, show the user
+`conda config --show channels` and `conda config --show channel_priority`.
+If `defaults` is listed above `conda-forge` and the env has packages from
+`conda-forge`, warn loudly before any update-all operation. Prefer targeted
+`conda update <specific-package>` over `--all` for conda envs that mix channels.
+
+## conda update --all Is Almost Never What You Want
+
+**Symptom:** Pulling the `--all` trigger on a long-lived conda env produces a
+multi-hundred-package solve that often downgrades, swaps channels, or breaks
+pinned relationships between packages (e.g. pytorch + CUDA builds).
+**Cause:** Conda envs drift over time. `--all` rebuilds the whole solve as if
+the env were being created fresh, which rarely matches what actually works.
+**Fix:** Update individual packages or small related groups:
+```bash
+conda update -n <env> -c conda-forge pytorch torchvision torchaudio
+conda update -n <env> -c conda-forge numpy scipy
+```
+**Check:** Never recommend `conda update --all` without a dry-run first, and
+never approve a dry-run plan that contains DOWNGRADE lines without
+highlighting them to the user.
 ```
 
 ---
@@ -998,6 +1110,11 @@ Pre-approve read-only commands to reduce permission prompts during audits:
       "Bash(softwareupdate -l:*)",
       "Bash(mas outdated:*)",
       "Bash(conda list:*)",
+      "Bash(conda config --show:*)",
+      "Bash(uv tool list:*)",
+      "Bash(uv --version:*)",
+      "Bash(pipx list:*)",
+      "Bash(tmutil destinationinfo:*)",
       "Bash(csrutil status:*)",
       "Bash(fdesetup status:*)",
       "Bash(spctl --status:*)",
